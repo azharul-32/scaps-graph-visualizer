@@ -20,22 +20,56 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator, LogLocator, AutoMinorLocator
 import streamlit as st
 
-st.set_page_config(page_title="SCAPS .iv Graph Generator", layout="wide")
+st.set_page_config(page_title="SCAPS-1D Data Visualizer", layout="wide")
 
 
 # ============================================================
 # PARSER - reads ALL columns directly from the file's own header
 # ============================================================
 
-def parse_iv_file(file_bytes):
-    text = file_bytes.decode("utf-8", errors="replace")
+def excel_to_pseudo_text(file_bytes):
+    """Converts a .xlsx export of a SCAPS .iv file (same content, just
+    saved as Excel with one value per cell) back into the same
+    tab-separated line format the text parser already understands -
+    this lets us reuse the exact same, already-tested parsing logic
+    for both file types instead of maintaining two separate parsers."""
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(file_bytes), read_only=True)
+    ws = wb.active
+    lines = []
+    for row in ws.iter_rows(values_only=True):
+        cells = [c for c in row if c is not None]
+        if not cells:
+            lines.append("")
+            continue
+        lines.append("\t".join(str(c) for c in cells))
+    return "\n".join(lines)
+
+
+def parse_uploaded_file(filename, file_bytes):
+    """Dispatches to the right reader based on file extension, then
+    runs the shared parsing logic on the resulting text either way."""
+    if filename.lower().endswith((".xlsx", ".xls")):
+        text = excel_to_pseudo_text(file_bytes)
+    else:
+        # SCAPS .iv text files are written in latin-1/cp1252 encoding
+        # (they can contain characters like µ for micrometers), NOT
+        # UTF-8 - decoding as UTF-8 fails/garbles the file. latin-1
+        # never raises an error and correctly handles every byte.
+        text = file_bytes.decode("latin-1")
+    return parse_iv_file(text)
+
+
+def parse_iv_file(text):
     lines = text.splitlines()
 
     simulations = []
     current_data_rows = []
     current_columns = None
     current_sim_number = None
+    current_batch_params = {}
     in_data = False
+    in_batch_params = False
     summary = {}
 
     for line in lines:
@@ -45,9 +79,11 @@ def parse_iv_file(file_bytes):
             if current_columns is not None and current_data_rows:
                 df = pd.DataFrame(current_data_rows, columns=current_columns)
                 simulations.append({"sim_number": current_sim_number,
-                                     "data": df, "summary": summary})
+                                     "data": df, "summary": summary,
+                                     "batch_params": current_batch_params})
             current_data_rows = []
             current_columns = None
+            current_batch_params = {}
             summary = {}
             m = re.search(r"#\s*(\d+)", stripped)
             step_m = re.search(r"step\s+(\d+)", stripped)
@@ -58,6 +94,41 @@ def parse_iv_file(file_bytes):
             else:
                 current_sim_number = len(simulations) + 1
             in_data = False
+            in_batch_params = False
+            continue
+
+        # SCAPS writes a "**Batch parameters**" section listing exactly
+        # which layer/parameter/unit/value was varied for this specific
+        # step - this is the authoritative source for auto-labeling,
+        # far more reliable than guessing from filenames or step order
+        if "**Batch parameters**" in stripped:
+            in_batch_params = True
+            continue
+        if in_batch_params:
+            if stripped == "":
+                in_batch_params = False
+                continue
+            # Format: "CdTe - bulk (L2)>>thickness[µm]:\t 1.000e+00"
+            bp_match = re.match(r"(.+?)>>(.+?)\[(.*?)\]:\s*(.+)", stripped)
+            if bp_match:
+                layer_name = bp_match.group(1).strip()
+                param_name = bp_match.group(2).strip()
+                unit = bp_match.group(3).strip()
+                try:
+                    value = float(bp_match.group(4).strip())
+                    # IMPORTANT: extract the short layer code (L1/L2/L3...)
+                    # and keep it in the key. Two different layers can have
+                    # a parameter with the same name (e.g. both L2 and L3
+                    # have "thickness") - without the layer code, those
+                    # would collide into one ambiguous label and silently
+                    # overwrite each other / look like the same parameter
+                    # with two contradictory values.
+                    code_match = re.search(r"\((L\d+)\)", layer_name)
+                    layer_code = code_match.group(1) if code_match else layer_name
+                    key = f"{layer_code}: {param_name} [{unit}]"
+                    current_batch_params[key] = value
+                except ValueError:
+                    pass
             continue
 
         if current_columns is None and stripped.startswith("v(V)"):
@@ -88,7 +159,8 @@ def parse_iv_file(file_bytes):
     if current_columns is not None and current_data_rows:
         df = pd.DataFrame(current_data_rows, columns=current_columns)
         simulations.append({"sim_number": current_sim_number,
-                             "data": df, "summary": summary})
+                             "data": df, "summary": summary,
+                             "batch_params": current_batch_params})
 
     return simulations
 
@@ -171,7 +243,7 @@ def apply_axis_styling(ax, x_col, font_size, show_ticks_and_grid, log_scale,
 # STREAMLIT INTERFACE
 # ============================================================
 
-st.title("SCAPS .iv File Graph Generator")
+st.title("SCAPS-1D Data Visualizer")
 st.markdown(
     "<p style='font-size:16px; margin-bottom:0px;'>By Azharul Islam</p>"
     "<p style='font-size:13px; color:gray; margin-top:2px;'>University of Chittagong</p>",
@@ -183,98 +255,120 @@ st.caption("Upload SCAPS .iv file(s) and build a fully customized graph. "
 if "annotations" not in st.session_state:
     st.session_state.annotations = []
 
-mode = st.radio("Mode", ["Single File (full customization)",
-                          "Batch Mode (multiple files, grid of graphs)"],
-                 horizontal=True)
+st.radio(
+    "Mode",
+    ["Single Simulation (upload a .iv file from a single-shot run)",
+     "Batch Sweep (upload a .iv file from a batch run)"],
+    horizontal=True,
+    help="This is just a guide - whichever you pick, the tool reads your "
+         "file's actual content and gives you the right interface either way."
+)
 
 # ============================================================
-# BATCH MODE
+# UNIFIED FILE HANDLING - auto-detects single vs. batch content
+# regardless of which mode label the user clicked above, so an
+# accidental mismatch never blocks their workflow
 # ============================================================
 
-if mode.startswith("Batch"):
-    st.subheader("Batch Mode")
-    uploaded_files = st.file_uploader("Upload multiple .iv files", type=["iv", "txt"],
-                                       accept_multiple_files=True)
-
-    if uploaded_files:
-        all_parsed = []
-        for uf in uploaded_files:
-            sims = parse_iv_file(uf.read())
-            if sims:
-                all_parsed.append({"name": uf.name, "sim": sims[0]})
-
-        if all_parsed:
-            common_cols = set(all_parsed[0]["sim"]["data"].columns)
-            for p in all_parsed[1:]:
-                common_cols &= set(p["sim"]["data"].columns)
-            common_cols = sorted(common_cols)
-
-            x_col = st.selectbox("X-axis parameter (applied to all files)", common_cols,
-                                  index=0)
-            y_col = st.selectbox("Y-axis parameter (applied to all files)",
-                                  [c for c in common_cols if c != x_col],
-                                  format_func=friendly)
-            batch_color = st.color_picker("Curve color (applied to all)", "#e60000")
-
-            if st.button("Generate Grid", type="primary"):
-                n = len(all_parsed)
-                ncols = min(3, n)
-                nrows = int(np.ceil(n / ncols))
-                fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 4.2 * nrows),
-                                          squeeze=False)
-                for i, p in enumerate(all_parsed):
-                    r, c = i // ncols, i % ncols
-                    ax = axes[r][c]
-                    df = p["sim"]["data"]
-                    ax.plot(df[x_col], df[y_col], color=batch_color, linewidth=0.9)
-                    ax.set_title(p["name"], fontsize=9)
-                    ax.set_xlabel(friendly(x_col), fontsize=8)
-                    ax.set_ylabel(friendly(y_col), fontsize=8)
-                    ax.tick_params(labelsize=7)
-                    for spine in ax.spines.values():
-                        spine.set_linewidth(0.6)
-                for j in range(n, nrows * ncols):
-                    axes[j // ncols][j % ncols].axis('off')
-
-                plt.tight_layout()
-                st.pyplot(fig)
-
-                png_buf = io.BytesIO()
-                fig.savefig(png_buf, format='png', dpi=300, bbox_inches='tight')
-                pdf_buf = io.BytesIO()
-                fig.savefig(pdf_buf, format='pdf', bbox_inches='tight')
-                dcol1, dcol2 = st.columns(2)
-                with dcol1:
-                    st.download_button("Download PNG", png_buf.getvalue(),
-                                        "batch_grid.png", "image/png")
-                with dcol2:
-                    st.download_button("Download PDF", pdf_buf.getvalue(),
-                                        "batch_grid.pdf", "application/pdf")
-
-# ============================================================
-# SINGLE FILE MODE
-# ============================================================
-
-else:
-    uploaded_file = st.file_uploader("Upload a SCAPS .iv file", type=["iv", "txt"])
+if True:
+    uploaded_file = st.file_uploader("Upload a SCAPS .iv file",
+                                      type=["iv", "txt", "xlsx", "xls"])
 
     if uploaded_file is not None:
-        simulations = parse_iv_file(uploaded_file.read())
+        simulations = parse_uploaded_file(uploaded_file.name, uploaded_file.read())
 
         if not simulations:
             st.error("No valid simulation data found in this file.")
         else:
             st.success(f"Found {len(simulations)} simulation(s) in this file.")
 
-            # --- Feature: overlay multiple simulations ---
+            # --- Feature: overlay multiple simulations, with automatic
+            # labeling from SCAPS's own "**Batch parameters**" section
+            # when available (shows exactly which parameter(s) were
+            # varied, e.g. "thickness=1.0µm, mun=10"), falling back to
+            # a plain step number if no batch parameters were found ---
+            def build_sim_label(s):
+                bp = s.get("batch_params", {})
+                if bp:
+                    # Keys are already short and distinct (e.g. "L2:
+                    # thickness [µm]") thanks to the layer-code fix above
+                    parts = [f"{k}={v:g}" for k, v in bp.items()]
+                    return f"Step {s['sim_number']}: " + ", ".join(parts)
+                return f"Simulation #{s['sim_number']}"
+
             if len(simulations) > 1:
-                sim_labels = [f"Simulation #{s['sim_number']}" for s in simulations]
-                selected_labels = st.multiselect(
-                    "Select simulation(s) to plot (choose 2+ to overlay)",
-                    sim_labels, default=[sim_labels[0]])
-                selected_sims = [simulations[sim_labels.index(lbl)] for lbl in selected_labels]
+                has_batch_params = any(s.get("batch_params") for s in simulations)
+
+                if has_batch_params:
+                    st.info("Detected SCAPS batch parameters.")
+                    selection_mode = st.radio(
+                        "How do you want to select which steps to plot?",
+                        ["Single-Parameter Sweep (vary one parameter, you choose the "
+                         "fixed value for every other)",
+                         "Custom Step Selection (freely pick any steps yourself)"],
+                        index=0
+                    )
+                else:
+                    selection_mode = "Custom Step Selection (freely pick any steps yourself)"
+
+                if selection_mode.startswith("Single-Parameter"):
+                    all_param_keys = sorted(set(
+                        k for s in simulations for k in s.get("batch_params", {}).keys()
+                    ))
+                    chosen_param = st.selectbox(
+                        "Which parameter do you want to compare across its different values?",
+                        all_param_keys)
+
+                    # For every OTHER varied parameter, let the user
+                    # explicitly choose which of its actual tested
+                    # values to hold fixed - via a real dropdown listing
+                    # every distinct value that parameter was run at,
+                    # not an automatic guess
+                    other_keys = [k for k in all_param_keys if k != chosen_param]
+                    reference_values = {}
+                    if other_keys:
+                        st.write(f"**Fix the other varied parameter(s):**")
+                        fix_cols = st.columns(len(other_keys))
+                        for col, k in zip(fix_cols, other_keys):
+                            distinct_vals = sorted(set(
+                                s["batch_params"][k] for s in simulations
+                                if k in s.get("batch_params", {})
+                            ))
+                            with col:
+                                chosen_val = st.selectbox(
+                                    k, distinct_vals,
+                                    format_func=lambda v: f"{v:g}",
+                                    key=f"fix_{k}")
+                                reference_values[k] = chosen_val
+
+                    matching_sims = [
+                        s for s in simulations
+                        if chosen_param in s.get("batch_params", {})
+                        and all(s["batch_params"].get(k) == v
+                                for k, v in reference_values.items())
+                    ]
+                    matching_sims.sort(key=lambda s: s["batch_params"][chosen_param])
+
+                    if matching_sims:
+                        found_vals = ", ".join(
+                            f"{s['batch_params'][chosen_param]:g}" for s in matching_sims)
+                        st.success(f"Found {len(matching_sims)} curve(s) for "
+                                   f"{chosen_param} = [{found_vals}]")
+                        selected_sims = matching_sims
+                    else:
+                        st.warning("No steps match this exact combination of fixed values.")
+                        selected_sims = []
+                else:
+                    sim_labels = [build_sim_label(s) for s in simulations]
+                    selected_labels = st.multiselect(
+                        "Select simulation(s) to plot (choose 2+ to overlay)",
+                        sim_labels, default=[sim_labels[0]])
+                    selected_sims = [simulations[sim_labels.index(lbl)] for lbl in selected_labels]
             else:
                 selected_sims = simulations
+
+            if not selected_sims:
+                st.stop()
 
             if not selected_sims:
                 st.info("Select at least one simulation above.")
@@ -300,9 +394,13 @@ else:
             multi_sim = len(selected_sims) > 1
             series_list = []
             for sim in selected_sims:
+                sim_label_short = build_sim_label(sim)
                 for ycol in y_cols:
-                    label = (f"Sim#{sim['sim_number']} - {friendly(ycol)}"
-                             if multi_sim else friendly(ycol))
+                    if multi_sim:
+                        label = (f"{sim_label_short} ({friendly(ycol)})" if len(y_cols) > 1
+                                  else sim_label_short)
+                    else:
+                        label = friendly(ycol)
                     series_list.append({"df": sim["data"], "ycol": ycol,
                                          "label": label, "summary": sim["summary"]})
 
